@@ -1,0 +1,20 @@
+[Unit]
+Description=Caddy Control Plane
+After=network.target caddy.service
+Requires=caddy.service
+
+[Service]
+# User will be replaced by the installer script
+User=PLACEHOLDER_USER
+Group=PLACEHOLDER_USER
+
+# Paths will be replaced by the installer script
+WorkingDirectory=PLACEHOLDER_DIR
+EnvironmentFile=PLACEHOLDER_DIR/.env
+ExecStart=PLACEHOLDER_DIR/caddy-control
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

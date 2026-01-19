@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Caddy Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .badge-role { font-size: 0.9em; text-transform: uppercase; }
+        input.is-invalid { border-color: #dc3545; background-image: none; }
+        input.is-valid { border-color: #198754; background-image: none; }
+        .validation-feedback { font-size: 0.85em; margin-top: 4px; display: none; }
+        .text-danger { color: #dc3545; display: block; }
+        .group-header { background-color: #e9ecef; font-weight: bold; color: #495057; }
+    </style>
+</head>
+<body class="bg-light">
+
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+        <div class="container">
+            <a class="navbar-brand" href="#">🚀 Caddy Control</a>
+            <div class="d-flex text-white align-items-center">
+                <span class="me-3">{{ .Email }} <span class="badge bg-secondary badge-role ms-1">{{ .Role }}</span></span>
+                <a href="/CaddyCfg/logout" class="btn btn-sm btn-outline-danger">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+
+        <div class="card shadow-sm mb-5">
+            <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">Active Reverse Proxies</h5>
+            </div>
+            <div class="card-body p-0">
+                <table class="table table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th class="ps-4">Full Domain</th>
+                            <th>Upstream Target</th>
+                            <th>Owner</th>
+                            <th class="text-end pe-4">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {{ range .ProxyGroups }}
+
+                        <tr class="group-header">
+                            <td colspan="4" class="ps-4">
+                                <i class="bi bi-folder"></i> Group: {{ .Name }}
+                            </td>
+                        </tr>
+
+                        {{ range .Items }}
+                        <tr>
+                            <td class="ps-4 fw-bold">
+                                <a href="http://{{ .Domain }}" target="_blank" class="text-decoration-none">{{ .Domain }}</a>
+                            </td>
+                            <td><code>{{ .Upstream }}</code></td>
+                            <td class="text-muted small">{{ .OwnerEmail }}</td>
+                            <td class="text-end pe-4">
+                                {{ if or (eq $.Role "admin") (eq .OwnerEmail $.Email) }}
+                                <form action="/CaddyCfg/proxy" method="POST" class="d-inline" onsubmit="return confirm('Are you sure you want to delete {{ .Domain }}?');">
+                                    <input type="hidden" name="action" value="delete">
+                                    <input type="hidden" name="id" value="{{ .ID }}">
+                                    <button class="btn btn-sm btn-danger">Delete</button>
+                                </form>
+                                {{ else }}
+                                <span class="text-muted small">View Only</span>
+                                {{ end }}
+                            </td>
+                        </tr>
+                        {{ end }} {{ else }}
+                        <tr>
+                            <td colspan="4" class="text-center py-4 text-muted">No proxies configured yet.</td>
+                        </tr>
+                        {{ end }} </tbody>
+                </table>
+            </div>
+
+            {{ if ne .Role "viewer" }}
+            <div class="card-footer bg-light p-4">
+                <h6 class="mb-3">Add New Proxy</h6>
+                <form action="/CaddyCfg/proxy" method="POST" class="row g-3" id="proxyForm" novalidate>
+                    <input type="hidden" name="action" value="upsert">
+
+                    <div class="col-md-5">
+                        <label class="form-label small text-muted">Subdomain</label>
+                        <div class="input-group">
+                            <input type="text" name="subdomain" class="form-control text-end" placeholder="api.dev" id="subdomainInput" required>
+                            <span class="input-group-text bg-white text-dark">.{{ .AllowedDomain }}</span>
+                        </div>
+                        <div id="subFeedback" class="validation-feedback text-danger"></div>
+                    </div>
+
+                    <div class="col-md-5">
+                        <label class="form-label small text-muted">Upstream (Private IP)</label>
+                        <input type="text" name="upstream" class="form-control" placeholder="192.168.1.50" id="upstreamInput" required>
+                        <div class="form-text small">Default port 80 will be added if omitted.</div>
+                        <div id="upFeedback" class="validation-feedback text-danger"></div>
+                    </div>
+
+                    <div class="col-md-2 d-flex align-items-end">
+                        <button type="submit" class="btn btn-success w-100">Create</button>
+                    </div>
+                </form>
+            </div>
+            {{ end }}
+        </div>
+
+        {{ if eq .Role "admin" }}
+        <div class="card shadow-sm border-warning">
+            <div class="card-header bg-warning bg-opacity-10 text-dark fw-bold">
+                🔒 User Access Control
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-6 border-end">
+                        <h6 class="text-muted mb-3">Authorized Users</h6>
+                        <ul class="list-group list-group-flush">
+                            {{ range .Users }}
+                            <li class="list-group-item d-flex justify-content-between align-items-center ps-0">
+                                {{ .Email }}
+                                <span class="badge bg-secondary">{{ .Role }}</span>
+                            </li>
+                            {{ end }}
+                        </ul>
+                    </div>
+                    <div class="col-md-6 ps-md-4">
+                        <h6 class="text-muted mb-3">Authorize New User</h6>
+                        <form action="/CaddyCfg/user" method="POST">
+                            <div class="mb-3"><input type="email" name="email" class="form-control" placeholder="user@gmail.com" required></div>
+                            <div class="mb-3">
+                                <select name="role" class="form-select">
+                                    <option value="viewer">Viewer</option>
+                                    <option value="creator">Creator</option>
+                                    <option value="admin">Admin</option>
+                                </select>
+                            </div>
+                            <button type="submit" class="btn btn-warning w-100">Authorize</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {{ end }}
+
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const form = document.getElementById('proxyForm');
+            const subInput = document.getElementById('subdomainInput');
+            const upInput = document.getElementById('upstreamInput');
+            const subFeedback = document.getElementById('subFeedback');
+            const upFeedback = document.getElementById('upFeedback');
+
+            if(!form) return;
+
+            subInput.addEventListener('input', function() {
+                this.value = this.value.toLowerCase().replace(/[^a-z0-9-.]/g, '');
+                const val = this.value;
+                if (val.length === 0) setInvalid(this, subFeedback, "Subdomain is required");
+                else if (val.startsWith('.') || val.endsWith('.')) setInvalid(this, subFeedback, "Cannot start or end with a dot");
+                else if (val.includes('..')) setInvalid(this, subFeedback, "Cannot contain consecutive dots");
+                else setValid(this, subFeedback);
+            });
+
+            upInput.addEventListener('blur', function() {
+                let val = this.value.trim();
+                if (val.length > 0 && !val.includes(':')) {
+                    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(val)) {
+                        this.value = val + ":80";
+                        this.dispatchEvent(new Event('input'));
+                    }
+                }
+            });
+
+            upInput.addEventListener('input', function() {
+                let val = this.value.trim();
+                let portPart = "80";
+                let ipPart = val;
+                if (val.includes(':')) {
+                    const parts = val.split(':');
+                    ipPart = parts[0];
+                    portPart = parts[1];
+                }
+                const port = parseInt(portPart, 10);
+                if (isNaN(port) || port < 1 || port > 65535) { setInvalid(this, upFeedback, "Invalid port number"); return; }
+
+                const ipRegex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+                const match = ipPart.match(ipRegex);
+                if (!match) { if (val.includes("[")) { setValid(this, upFeedback); return; } setInvalid(this, upFeedback, "Invalid IPv4 address format"); return; }
+
+                const oct1 = parseInt(match[1], 10);
+                const oct2 = parseInt(match[2], 10);
+                let isPrivate = false;
+                if (oct1 === 127 || oct1 === 10) isPrivate = true;
+                else if (oct1 === 192 && oct2 === 168) isPrivate = true;
+                else if (oct1 === 172 && (oct2 >= 16 && oct2 <= 31)) isPrivate = true;
+
+                if (!isPrivate) setInvalid(this, upFeedback, "Must be a local/private IP");
+                else setValid(this, upFeedback);
+            });
+
+            function setInvalid(el, feedbackEl, msg) {
+                el.classList.add('is-invalid'); el.classList.remove('is-valid');
+                feedbackEl.innerText = msg; feedbackEl.style.display = 'block';
+                el.setCustomValidity(msg);
+            }
+            function setValid(el, feedbackEl) {
+                el.classList.remove('is-invalid'); el.classList.add('is-valid');
+                feedbackEl.style.display = 'none'; el.setCustomValidity("");
+            }
+
+            form.addEventListener('submit', function(e) {
+                let val = upInput.value.trim();
+                if (val.length > 0 && !val.includes(':')) upInput.value = val + ":80";
+                if (!form.checkValidity()) {
+                    e.preventDefault(); e.stopPropagation();
+                    subInput.dispatchEvent(new Event('input')); upInput.dispatchEvent(new Event('input'));
+                }
+            });
+        });
+    </script>
+</body>
+</html>
