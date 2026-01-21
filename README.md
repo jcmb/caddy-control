@@ -72,6 +72,20 @@ SSH into your computer and run the following commands:
 
 3. Run the installer:
    ./scripts/install.sh
+   
+#### Step 2.5
+   Fix Go 
+   
+    go mod download github.com/gorilla/sessions
+   	go mod download github.com/joho/godotenv
+	go mod download github.com/mattn/go-sqlite3
+	go mod download google.golang.org/api
+
+    go get github.com/gorilla/sessions
+    go mod download github.com/gorilla/securecookie
+    go get google.golang.org/api/idtoken
+    go get google.golang.org/api/internal
+    
 
 #### Step 3: Configuration
 
