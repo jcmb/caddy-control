@@ -1,7 +1,7 @@
 [Unit]
 Description=Caddy Control Plane
 After=network.target caddy.service
-Requires=caddy.service
+PartOf=caddy.service
 
 [Service]
 # User will be replaced by the installer script
