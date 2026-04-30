@@ -373,7 +373,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		deleteCaddy(id)
-		db.Exec("DELETE FROM proxies WHERE id=?", id)
+		if _, err := db.Exec("DELETE FROM proxies WHERE id=?", id); err != nil {
+			log.Printf("proxy delete DB error: %v", err)
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
 	} else {
 		subdomain := strings.ToLower(strings.TrimSpace(r.FormValue("subdomain")))
 		upstream := strings.TrimSpace(r.FormValue("upstream"))
@@ -396,10 +400,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		p := Proxy{ID: newID, OwnerEmail: email, Domain: fullDomain, Upstream: upstream}
 
 		if err := updateCaddy(p); err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		db.Exec("INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream) VALUES (?, ?, ?, ?)", newID, email, fullDomain, upstream)
+		if _, err := db.Exec("INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream) VALUES (?, ?, ?, ?)", newID, email, fullDomain, upstream); err != nil {
+			log.Printf("proxy upsert DB error: %v", err)
+			http.Error(w, fmt.Sprintf("Caddy was updated but database write failed: %v", err), http.StatusInternalServerError)
+			return
+		}
 	}
 	http.Redirect(w, r, "/CaddyCfg/", http.StatusFound)
 }
