@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"html/template"
 	"io"
@@ -373,7 +374,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		deleteCaddy(id)
-		db.Exec("DELETE FROM proxies WHERE id=?", id)
+		if _, err := db.Exec("DELETE FROM proxies WHERE id=?", id); err != nil {
+			log.Printf("proxy delete DB error: %v", err)
+			http.Error(w, "database error", http.StatusInternalServerError)
+			return
+		}
 	} else {
 		subdomain := strings.ToLower(strings.TrimSpace(r.FormValue("subdomain")))
 		upstream := strings.TrimSpace(r.FormValue("upstream"))
@@ -396,10 +401,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		p := Proxy{ID: newID, OwnerEmail: email, Domain: fullDomain, Upstream: upstream}
 
 		if err := updateCaddy(p); err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		db.Exec("INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream) VALUES (?, ?, ?, ?)", newID, email, fullDomain, upstream)
+		if _, err := db.Exec("INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream) VALUES (?, ?, ?, ?)", newID, email, fullDomain, upstream); err != nil {
+			log.Printf("proxy upsert DB error: %v", err)
+			http.Error(w, fmt.Sprintf("Caddy was updated but database write failed: %v", err), http.StatusInternalServerError)
+			return
+		}
 	}
 	http.Redirect(w, r, "/CaddyCfg/", http.StatusFound)
 }
@@ -417,6 +426,12 @@ func handleUser(w http.ResponseWriter, r *http.Request) {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	godotenv.Load()
+
+	// -http-port overrides PORT when non-empty; precedence: flag > PORT > default 8080.
+	httpPortFlag := flag.String("http-port", "", "HTTP listen port (overrides PORT)")
+	// -http-bind overrides BIND when non-empty; precedence: flag > BIND > 127.0.0.1.
+	httpBindFlag := flag.String("http-bind", "", "HTTP listen bind address (overrides BIND; default 127.0.0.1)")
+	flag.Parse()
 
 	allowedBaseDomain = os.Getenv("ALLOWED_DOMAIN")
 	if allowedBaseDomain == "" { allowedBaseDomain = "co-test-site.com" }
@@ -442,12 +457,26 @@ func main() {
 	mux.HandleFunc("/user", authRequired(handleUser))
 
 	port := os.Getenv("PORT")
-	if port == "" { port = "8080" }
+	if port == "" {
+		port = "8080"
+	}
+	if *httpPortFlag != "" {
+		port = *httpPortFlag
+	}
+
+	bind := os.Getenv("BIND")
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	if *httpBindFlag != "" {
+		bind = *httpBindFlag
+	}
+	addr := net.JoinHostPort(bind, port)
 
 	rootHandler := http.StripPrefix("/CaddyCfg", mux)
 
-	log.Printf("Listening on :%s (Mapped to /CaddyCfg)...", port)
-	if err := http.ListenAndServe(":"+port, rootHandler); err != nil {
+	log.Printf("Listening on %s (Mapped to /CaddyCfg)...", addr)
+	if err := http.ListenAndServe(addr, rootHandler); err != nil {
 		log.Fatal("Server failed to start:", err)
 	}
 }
