@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"html/template"
 	"io"
@@ -426,6 +427,12 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	godotenv.Load()
 
+	// -http-port overrides PORT when non-empty; precedence: flag > PORT > default 8080.
+	httpPortFlag := flag.String("http-port", "", "HTTP listen port (overrides PORT)")
+	// -http-bind overrides BIND when non-empty; precedence: flag > BIND > 127.0.0.1.
+	httpBindFlag := flag.String("http-bind", "", "HTTP listen bind address (overrides BIND; default 127.0.0.1)")
+	flag.Parse()
+
 	allowedBaseDomain = os.Getenv("ALLOWED_DOMAIN")
 	if allowedBaseDomain == "" { allowedBaseDomain = "co-test-site.com" }
 	allowedBaseDomain = strings.TrimPrefix(allowedBaseDomain, ".")
@@ -450,12 +457,26 @@ func main() {
 	mux.HandleFunc("/user", authRequired(handleUser))
 
 	port := os.Getenv("PORT")
-	if port == "" { port = "8080" }
+	if port == "" {
+		port = "8080"
+	}
+	if *httpPortFlag != "" {
+		port = *httpPortFlag
+	}
+
+	bind := os.Getenv("BIND")
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	if *httpBindFlag != "" {
+		bind = *httpBindFlag
+	}
+	addr := net.JoinHostPort(bind, port)
 
 	rootHandler := http.StripPrefix("/CaddyCfg", mux)
 
-	log.Printf("Listening on :%s (Mapped to /CaddyCfg)...", port)
-	if err := http.ListenAndServe(":"+port, rootHandler); err != nil {
+	log.Printf("Listening on %s (Mapped to /CaddyCfg)...", addr)
+	if err := http.ListenAndServe(addr, rootHandler); err != nil {
 		log.Fatal("Server failed to start:", err)
 	}
 }
