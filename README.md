@@ -31,9 +31,25 @@ You can only add sub domains to the primary domain. The upstream IP only support
 
 The admin can add new users to the system with their roles. Note that the Google OAuth console must allow these users access.
 
+## HTTP listen address and port
 
+By default the app listens on **127.0.0.1:8080** (loopback only). That matches a typical setup where Caddy on the same host reverse-proxies to `localhost:8080`.
 
-##Installation
+| Setting | Environment variable | Command-line override |
+|--------|------------------------|------------------------|
+| Port | `PORT` (default `8080`) | `-http-port` |
+| Bind address | `BIND` (default `127.0.0.1`) | `-http-bind` |
+
+Precedence for each value is **flag → environment variable → default**. Use `BIND=0.0.0.0` (or `-http-bind 0.0.0.0`) only when you need the process to accept connections from other machines without a local reverse proxy.
+
+Example:
+
+```bash
+cd app
+go run . -http-port 9090 -http-bind 127.0.0.1
+```
+
+## Installation
 
 ### Caddy Configuration
 
@@ -48,10 +64,9 @@ domain {
  }
 ```
 
-8080 is the default port, and can be overridden in the .env file
+With defaults, the app is reachable at `127.0.0.1:8080`; adjust `PORT` / `BIND` in `.env` or Caddy’s `reverse_proxy` target if you change them.
 
-
-###Caddy Control Plane - Installation Instructions
+### Caddy Control Plane - Installation Instructions
 
 
 #### Step 1: Transfer to Computer
@@ -73,19 +88,9 @@ SSH into your computer and run the following commands:
 3. Run the installer:
    ./scripts/install.sh
    
-#### Step 2.5
-   Fix Go 
-   
-    go mod download github.com/gorilla/sessions
-   	go mod download github.com/joho/godotenv
-	go mod download github.com/mattn/go-sqlite3
-	go mod download google.golang.org/api
+#### Step 2.5: Build from source (optional)
 
-    go get github.com/gorilla/sessions
-    go mod download github.com/gorilla/securecookie
-    go get google.golang.org/api/idtoken
-    go get google.golang.org/api/internal
-    
+The Go module lives in the `app` directory (`app/go.mod`, `app/go.sum`). From `app/`, run `go mod download` or `go mod tidy` if dependencies are missing, then `go build -o caddy-control .` or `go run .`.
 
 #### Step 3: Configuration
 
@@ -99,6 +104,7 @@ You MUST edit the .env file to add your Google Client ID.
    - Set SESSION_SECRET=...
    - Set ADMIN_EMAIL=...
    - Set ALLOWED_DOMAIN=... (e.g. co-test-site.com)
+   - Optional: `PORT` (default `8080`) and `BIND` (default `127.0.0.1`) for the HTTP server; see **HTTP listen address and port** above.
 
 The GOOGLE\_CLIENT\_ID and SESSION_SECRET is from the Google OAuth console that defines the application.
 
