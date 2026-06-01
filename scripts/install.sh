@@ -18,9 +18,10 @@ fi
 
 # 2. Build the Application
 echo "📦 Building application..."
+VERSION=$(cat VERSION 2>/dev/null || echo "1.22")
 cd app
 go mod tidy
-go build -o $APP_NAME main.go
+go build -ldflags "-X main.version=$VERSION" -o $APP_NAME main.go
 if [ $? -ne 0 ]; then
     echo "❌ Build failed."
     exit 1

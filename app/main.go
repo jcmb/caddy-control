@@ -20,7 +20,7 @@ import (
 
 	"github.com/gorilla/sessions"
 	"github.com/joho/godotenv"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"google.golang.org/api/idtoken"
 )
 
@@ -31,6 +31,7 @@ var (
 	templates         *template.Template
 	allowedBaseDomain string
 	caddyAPIPort      string
+	version           = "1.22"
 	privateIPBlocks   []*net.IPNet
 	subdomainRegex    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 )
@@ -60,6 +61,7 @@ type PageData struct {
 	Users         []User
 	ClientId      string
 	AllowedDomain string
+	Version       string
 	Error         string
 }
 
@@ -78,7 +80,7 @@ func init() {
 func initDB() {
 	log.Println("Initializing SQLite database...")
 	var err error
-	db, err = sql.Open("sqlite3", "./caddy_data.db")
+	db, err = sql.Open("sqlite", "./caddy_data.db")
 	if err != nil {
 		log.Fatal("Failed to open database:", err)
 	}
@@ -351,7 +353,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	templates.ExecuteTemplate(w, "index.html", PageData{
-		Email: email, Role: role, ProxyGroups: proxyGroups, Users: users, AllowedDomain: allowedBaseDomain,
+		Email: email, Role: role, ProxyGroups: proxyGroups, Users: users, AllowedDomain: allowedBaseDomain, Version: version,
 	})
 }
 
@@ -431,7 +433,13 @@ func main() {
 	httpPortFlag := flag.String("http-port", "", "HTTP listen port (overrides PORT)")
 	// -http-bind overrides BIND when non-empty; precedence: flag > BIND > 127.0.0.1.
 	httpBindFlag := flag.String("http-bind", "", "HTTP listen bind address (overrides BIND; default 127.0.0.1)")
+	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	allowedBaseDomain = os.Getenv("ALLOWED_DOMAIN")
 	if allowedBaseDomain == "" { allowedBaseDomain = "co-test-site.com" }

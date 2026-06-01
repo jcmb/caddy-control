@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            label: windows_amd64
+            ext: .exe
+          - goos: darwin
+            goarch: arm64
+            label: darwin_arm64
+            ext: ""
+          - goos: linux
+            goarch: amd64
+            label: linux_amd64
+            ext: ""
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            label: linux_armv7
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            label: linux_arm64
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: app/go.sum
+
+      - name: Read version
+        id: meta
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        working-directory: app
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          OUT="../caddy-control_${VERSION}_${{ matrix.label }}${{ matrix.ext }}"
+          go build -ldflags "-X main.version=${VERSION}" -o "$OUT" main.go
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: caddy-control_${{ steps.meta.outputs.version }}_${{ matrix.label }}${{ matrix.ext }}

@@ -1,2 +1,3 @@
 .DS_Store
 app/caddy_data.db
+dist/
