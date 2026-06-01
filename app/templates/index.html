@@ -54,7 +54,7 @@
                         {{ range .Items }}
                         <tr>
                             <td class="ps-4 fw-bold">
-                                <a href="http://{{ .Domain }}" target="_blank" class="text-decoration-none">{{ .Domain }}</a>
+                                <a href="https://{{ .Domain }}" target="_blank" rel="noopener noreferrer" class="text-decoration-none">{{ .Domain }}</a>
                             </td>
                             <td><code>{{ .Upstream }}</code></td>
                             <td class="text-muted small">{{ .OwnerEmail }}</td>
