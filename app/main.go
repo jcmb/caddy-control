@@ -173,6 +173,21 @@ func naturalLess(s1, s2 string) bool {
 
 // --- Caddy API Helpers ---
 
+// reverseProxyHandle returns a Caddy reverse_proxy handler tuned for long-lived
+// streaming responses (SSE, WebSockets). Without flush_interval and disabled
+// upstream compression, events can be buffered or gzip-encoded and never reach clients.
+func reverseProxyHandle(finalUpstream string) map[string]interface{} {
+	return map[string]interface{}{
+		"handler":        "reverse_proxy",
+		"upstreams":      []interface{}{map[string]string{"dial": finalUpstream}},
+		"flush_interval": -1,
+		"transport": map[string]interface{}{
+			"protocol":    "http",
+			"compression": false,
+		},
+	}
+}
+
 func updateCaddy(p Proxy) error {
 	finalUpstream := p.Upstream
 	if !strings.Contains(finalUpstream, ":") {
@@ -187,10 +202,7 @@ func updateCaddy(p Proxy) error {
 			map[string]interface{}{"host": []string{p.Domain}},
 		},
 		"handle": []interface{}{
-			map[string]interface{}{
-				"handler": "reverse_proxy",
-				"upstreams": []interface{}{map[string]string{"dial": finalUpstream}},
-			},
+			reverseProxyHandle(finalUpstream),
 		},
 	}
 	jsonData, _ := json.Marshal(route)
