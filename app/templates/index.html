@@ -28,9 +28,20 @@
 
     <div class="container">
 
+        {{ if eq .SyncStatus "ok" }}
+        <div class="alert alert-success">Caddy resync completed successfully.</div>
+        {{ else if eq .SyncStatus "error" }}
+        <div class="alert alert-danger">Caddy resync failed. Check server logs for details.</div>
+        {{ end }}
+
         <div class="card shadow-sm mb-5">
             <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
                 <h5 class="mb-0">Active Reverse Proxies</h5>
+                {{ if eq .Role "admin" }}
+                <form action="/CaddyCfg/sync" method="POST" class="mb-0">
+                    <button type="submit" class="btn btn-sm btn-outline-primary">Resync Caddy</button>
+                </form>
+                {{ end }}
             </div>
             <div class="card-body p-0">
                 <table class="table table-hover mb-0">
