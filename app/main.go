@@ -35,7 +35,7 @@ var (
 	templates         *template.Template
 	allowedBaseDomain string
 	caddyAPIPort      string
-	version           = "1.24"
+	version           = "1.25"
 	privateIPBlocks   []*net.IPNet
 	subdomainRegex    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 )
@@ -230,11 +230,94 @@ func reverseProxyHandle(finalUpstream string, upstreamTLS, tlsInsecure bool) map
 	}
 }
 
+// routeMatchesProxy reports whether a Caddy route belongs to the given proxy.
+func routeMatchesProxy(route map[string]interface{}, proxyID, domain string) bool {
+	if id, ok := route["@id"].(string); ok && id == proxyID {
+		return true
+	}
+	if domain == "" {
+		return false
+	}
+	matches, ok := route["match"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, m := range matches {
+		mobj, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		hosts, ok := mobj["host"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, h := range hosts {
+			if hs, ok := h.(string); ok && hs == domain {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// scrubRoutesForProxy removes stale route entries from srv0 before upserting.
+// Duplicates can accumulate when a non-200 PUT (e.g. 201 Created) incorrectly
+// fell through to POST in older versions.
+func scrubRoutesForProxy(proxyID, domain string) error {
+	url := fmt.Sprintf("http://localhost:%s/config/apps/http/servers/srv0/routes", caddyAPIPort)
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("fetch routes (%d): %s", resp.StatusCode, string(b))
+	}
+
+	var routes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
+		return err
+	}
+
+	filtered := make([]map[string]interface{}, 0, len(routes))
+	removed := 0
+	for _, route := range routes {
+		if routeMatchesProxy(route, proxyID, domain) {
+			removed++
+			continue
+		}
+		filtered = append(filtered, route)
+	}
+	if removed == 0 {
+		return nil
+	}
+
+	log.Printf("Caddy: Removed %d stale route(s) for %s (%s)", removed, domain, proxyID)
+	jsonData, _ := json.Marshal(filtered)
+	req, _ := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	putResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode >= 400 {
+		b, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("rewrite routes (%d): %s", putResp.StatusCode, string(b))
+	}
+	return nil
+}
+
 func updateCaddy(p Proxy) error {
 	finalUpstream := finalizeUpstream(p.Upstream, p.UpstreamTLS)
 
 	log.Printf("Caddy: Upserting route %s -> %s (ID: %s, TLS: %v, insecure: %v)",
 		p.Domain, finalUpstream, p.ID, p.UpstreamTLS, p.TLSInsecure)
+
+	if err := scrubRoutesForProxy(p.ID, p.Domain); err != nil {
+		log.Printf("Caddy: scrub warning for %s: %v", p.ID, err)
+	}
 
 	route := map[string]interface{}{
 		"@id": p.ID,
@@ -247,37 +330,34 @@ func updateCaddy(p Proxy) error {
 	}
 	jsonData, _ := json.Marshal(route)
 
-	client := &http.Client{}
-
 	idUrl := fmt.Sprintf("http://localhost:%s/id/%s", caddyAPIPort, p.ID)
 	req, _ := http.NewRequest("PUT", idUrl, bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil { return err }
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 200 {
+	if resp.StatusCode == 200 || resp.StatusCode == 201 {
 		return nil
 	}
 
-	createUrl := fmt.Sprintf("http://localhost:%s/config/apps/http/servers/srv0/routes", caddyAPIPort)
-	resp2, err := client.Post(createUrl, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil { return err }
-	defer resp2.Body.Close()
-
-	if resp2.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp2.Body)
-		return fmt.Errorf("caddy error: %s", string(b))
-	}
-	return nil
+	b, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("caddy PUT error (%d): %s", resp.StatusCode, string(b))
 }
 
 func deleteCaddy(id string) {
+	var domain string
+	db.QueryRow("SELECT domain FROM proxies WHERE id=?", id).Scan(&domain)
+	if err := scrubRoutesForProxy(id, domain); err != nil {
+		log.Printf("Caddy: scrub warning for %s: %v", id, err)
+	}
+
 	url := fmt.Sprintf("http://localhost:%s/id/%s", caddyAPIPort, id)
 	req, _ := http.NewRequest("DELETE", url, nil)
-	client := &http.Client{}
-	client.Do(req)
+	http.DefaultClient.Do(req)
 }
 
 // --- Sync Database to Caddy ---
