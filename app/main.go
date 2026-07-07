@@ -38,10 +38,12 @@ var (
 
 // --- Data Models ---
 type Proxy struct {
-	ID         string
-	OwnerEmail string
-	Domain     string
-	Upstream   string
+	ID           string
+	OwnerEmail   string
+	Domain       string
+	Upstream     string
+	UpstreamTLS  bool
+	TLSInsecure  bool
 }
 
 type ProxyGroup struct {
@@ -91,6 +93,16 @@ func initDB() {
 	`
 	if _, err := db.Exec(queries); err != nil {
 		log.Fatal("Failed to create tables:", err)
+	}
+
+	migrations := []string{
+		`ALTER TABLE proxies ADD COLUMN upstream_tls INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE proxies ADD COLUMN tls_insecure INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, q := range migrations {
+		if _, err := db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			log.Printf("DB migration note: %v", err)
+		}
 	}
 
 	admin := strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL")))
@@ -147,6 +159,23 @@ func validateUpstream(upstream string) error {
 	return nil
 }
 
+func finalizeUpstream(upstream string, tls bool) string {
+	if strings.Contains(upstream, ":") {
+		return upstream
+	}
+	if tls {
+		return upstream + ":443"
+	}
+	return upstream + ":80"
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // --- Sorting Helpers ---
 func isDigit(b byte) bool { return '0' <= b && b <= '9' }
 
@@ -176,25 +205,32 @@ func naturalLess(s1, s2 string) bool {
 // reverseProxyHandle returns a Caddy reverse_proxy handler tuned for long-lived
 // streaming responses (SSE, WebSockets). Without flush_interval and disabled
 // upstream compression, events can be buffered or gzip-encoded and never reach clients.
-func reverseProxyHandle(finalUpstream string) map[string]interface{} {
+func reverseProxyHandle(finalUpstream string, upstreamTLS, tlsInsecure bool) map[string]interface{} {
+	transport := map[string]interface{}{
+		"protocol":    "http",
+		"compression": false,
+	}
+	if upstreamTLS {
+		tls := map[string]interface{}{}
+		if tlsInsecure {
+			tls["insecure_skip_verify"] = true
+		}
+		transport["tls"] = tls
+	}
+
 	return map[string]interface{}{
 		"handler":        "reverse_proxy",
 		"upstreams":      []interface{}{map[string]string{"dial": finalUpstream}},
 		"flush_interval": -1,
-		"transport": map[string]interface{}{
-			"protocol":    "http",
-			"compression": false,
-		},
+		"transport":      transport,
 	}
 }
 
 func updateCaddy(p Proxy) error {
-	finalUpstream := p.Upstream
-	if !strings.Contains(finalUpstream, ":") {
-		finalUpstream = finalUpstream + ":80"
-	}
+	finalUpstream := finalizeUpstream(p.Upstream, p.UpstreamTLS)
 
-	log.Printf("Caddy: Upserting route %s -> %s (ID: %s)", p.Domain, finalUpstream, p.ID)
+	log.Printf("Caddy: Upserting route %s -> %s (ID: %s, TLS: %v, insecure: %v)",
+		p.Domain, finalUpstream, p.ID, p.UpstreamTLS, p.TLSInsecure)
 
 	route := map[string]interface{}{
 		"@id": p.ID,
@@ -202,7 +238,7 @@ func updateCaddy(p Proxy) error {
 			map[string]interface{}{"host": []string{p.Domain}},
 		},
 		"handle": []interface{}{
-			reverseProxyHandle(finalUpstream),
+			reverseProxyHandle(finalUpstream, p.UpstreamTLS, p.TLSInsecure),
 		},
 	}
 	jsonData, _ := json.Marshal(route)
@@ -244,7 +280,7 @@ func deleteCaddy(id string) {
 func syncProxies() {
 	log.Println("Sync: Starting synchronization of Database -> Caddy...")
 
-	rows, err := db.Query("SELECT id, owner_email, domain, upstream FROM proxies")
+	rows, err := db.Query("SELECT id, owner_email, domain, upstream, upstream_tls, tls_insecure FROM proxies")
 	if err != nil {
 		log.Printf("Sync Error: Failed to fetch proxies: %v", err)
 		return
@@ -254,7 +290,10 @@ func syncProxies() {
 	count := 0
 	for rows.Next() {
 		var p Proxy
-		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream)
+		var upstreamTLS, tlsInsecure int
+		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream, &upstreamTLS, &tlsInsecure)
+		p.UpstreamTLS = upstreamTLS != 0
+		p.TLSInsecure = tlsInsecure != 0
 
 		go func(proxy Proxy) {
 			for i := 0; i < 5; i++ {
@@ -325,13 +364,16 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	email := session.Values["email"].(string)
 	role := session.Values["role"].(string)
 
-	rows, _ := db.Query("SELECT id, owner_email, domain, upstream FROM proxies")
+	rows, _ := db.Query("SELECT id, owner_email, domain, upstream, upstream_tls, tls_insecure FROM proxies")
 
 	groupsMap := make(map[string][]Proxy)
 
 	for rows.Next() {
 		var p Proxy
-		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream)
+		var upstreamTLS, tlsInsecure int
+		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream, &upstreamTLS, &tlsInsecure)
+		p.UpstreamTLS = upstreamTLS != 0
+		p.TLSInsecure = tlsInsecure != 0
 
 		sub := strings.TrimSuffix(p.Domain, "." + allowedBaseDomain)
 		parts := strings.Split(sub, ".")
@@ -396,10 +438,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else {
 		subdomain := strings.ToLower(strings.TrimSpace(r.FormValue("subdomain")))
 		upstream := strings.TrimSpace(r.FormValue("upstream"))
-
-		if !strings.Contains(upstream, ":") {
-			upstream = upstream + ":80"
+		upstreamTLS := r.FormValue("upstream_tls") == "1"
+		tlsInsecure := r.FormValue("tls_insecure") == "1"
+		if tlsInsecure && !upstreamTLS {
+			tlsInsecure = false
 		}
+
+		upstream = finalizeUpstream(upstream, upstreamTLS)
 
 		if err := validateSubdomain(subdomain); err != nil {
 			http.Error(w, err.Error(), 400)
@@ -412,13 +457,19 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		fullDomain := fmt.Sprintf("%s.%s", subdomain, allowedBaseDomain)
 		newID := "proxy-" + subdomain
-		p := Proxy{ID: newID, OwnerEmail: email, Domain: fullDomain, Upstream: upstream}
+		p := Proxy{
+			ID: newID, OwnerEmail: email, Domain: fullDomain, Upstream: upstream,
+			UpstreamTLS: upstreamTLS, TLSInsecure: tlsInsecure,
+		}
 
 		if err := updateCaddy(p); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if _, err := db.Exec("INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream) VALUES (?, ?, ?, ?)", newID, email, fullDomain, upstream); err != nil {
+		if _, err := db.Exec(
+			"INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream, upstream_tls, tls_insecure) VALUES (?, ?, ?, ?, ?, ?)",
+			newID, email, fullDomain, upstream, boolToInt(upstreamTLS), boolToInt(tlsInsecure),
+		); err != nil {
 			log.Printf("proxy upsert DB error: %v", err)
 			http.Error(w, fmt.Sprintf("Caddy was updated but database write failed: %v", err), http.StatusInternalServerError)
 			return
