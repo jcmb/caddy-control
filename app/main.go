@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,9 @@ import (
 	"google.golang.org/api/idtoken"
 )
 
+//go:embed templates/*
+var templateFS embed.FS
+
 // --- Global Variables ---
 var (
 	db                *sql.DB
@@ -31,7 +35,7 @@ var (
 	templates         *template.Template
 	allowedBaseDomain string
 	caddyAPIPort      string
-	version           = "1.23"
+	version           = "1.24"
 	privateIPBlocks   []*net.IPNet
 	subdomainRegex    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 )
@@ -514,7 +518,7 @@ func main() {
 	initDB()
 	go syncProxies()
 
-	templates = template.Must(template.ParseGlob("templates/*.html"))
+	templates = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 
 	store = sessions.NewCookieStore([]byte(os.Getenv("SESSION_SECRET")))
 	store.Options = &sessions.Options{Path: "/", MaxAge: 86400 * 7, HttpOnly: true}

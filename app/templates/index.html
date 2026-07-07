@@ -87,40 +87,48 @@
             {{ if ne .Role "viewer" }}
             <div class="card-footer bg-light p-4">
                 <h6 class="mb-3">Add New Proxy</h6>
-                <form action="/CaddyCfg/proxy" method="POST" class="row g-3" id="proxyForm" novalidate>
+                <form action="/CaddyCfg/proxy" method="POST" id="proxyForm" novalidate>
                     <input type="hidden" name="action" value="upsert">
 
-                    <div class="col-md-4">
-                        <label class="form-label small text-muted">Subdomain</label>
-                        <div class="input-group">
-                            <input type="text" name="subdomain" class="form-control text-end" placeholder="api.dev" id="subdomainInput" required>
-                            <span class="input-group-text bg-white text-dark">.{{ .AllowedDomain }}</span>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-5">
+                            <label class="form-label small text-muted">Subdomain</label>
+                            <div class="input-group">
+                                <input type="text" name="subdomain" class="form-control text-end" placeholder="api.dev" id="subdomainInput" required>
+                                <span class="input-group-text bg-white text-dark">.{{ .AllowedDomain }}</span>
+                            </div>
+                            <div id="subFeedback" class="validation-feedback text-danger"></div>
                         </div>
-                        <div id="subFeedback" class="validation-feedback text-danger"></div>
+
+                        <div class="col-md-5">
+                            <label class="form-label small text-muted">Upstream (Private IP)</label>
+                            <input type="text" name="upstream" class="form-control" placeholder="192.168.1.50" id="upstreamInput" required>
+                            <div class="form-text small">Default port 80 (HTTP) or 443 (TLS) if omitted.</div>
+                            <div id="upFeedback" class="validation-feedback text-danger"></div>
+                        </div>
+
+                        <div class="col-md-2 d-flex align-items-end">
+                            <button type="submit" class="btn btn-success w-100">Create</button>
+                        </div>
                     </div>
 
-                    <div class="col-md-4">
-                        <label class="form-label small text-muted">Upstream (Private IP)</label>
-                        <input type="text" name="upstream" class="form-control" placeholder="192.168.1.50" id="upstreamInput" required>
-                        <div class="form-text small">Default port 80 (HTTP) or 443 (TLS) if omitted.</div>
-                        <div id="upFeedback" class="validation-feedback text-danger"></div>
-                    </div>
-
-                    <div class="col-md-4">
-                        <label class="form-label small text-muted">Upstream TLS</label>
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="upstream_tls" value="1" id="upstreamTlsInput">
-                            <label class="form-check-label" for="upstreamTlsInput">Connect with HTTPS</label>
+                    <div class="border rounded bg-white p-3">
+                        <div class="fw-semibold mb-2">Upstream TLS</div>
+                        <div class="row g-2">
+                            <div class="col-md-6">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" name="upstream_tls" value="1" id="upstreamTlsInput">
+                                    <label class="form-check-label" for="upstreamTlsInput">Connect with HTTPS</label>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" name="tls_insecure" value="1" id="tlsInsecureInput" disabled>
+                                    <label class="form-check-label" for="tlsInsecureInput">Ignore certificate errors</label>
+                                </div>
+                            </div>
                         </div>
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="tls_insecure" value="1" id="tlsInsecureInput" disabled>
-                            <label class="form-check-label" for="tlsInsecureInput">Ignore certificate errors</label>
-                        </div>
-                        <div class="form-text small text-warning">Only use insecure TLS for self-signed or private CA certs.</div>
-                    </div>
-
-                    <div class="col-md-2 d-flex align-items-end">
-                        <button type="submit" class="btn btn-success w-100">Create</button>
+                        <div class="form-text small text-warning mb-0">Use insecure TLS only for self-signed or private CA certificates.</div>
                     </div>
                 </form>
             </div>
