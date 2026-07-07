@@ -31,7 +31,7 @@ var (
 	templates         *template.Template
 	allowedBaseDomain string
 	caddyAPIPort      string
-	version           = "1.22"
+	version           = "1.23"
 	privateIPBlocks   []*net.IPNet
 	subdomainRegex    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 )
