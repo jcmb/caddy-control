@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/sessions"
@@ -24,6 +26,9 @@ import (
 	"google.golang.org/api/idtoken"
 )
 
+//go:embed templates/*
+var templateFS embed.FS
+
 // --- Global Variables ---
 var (
 	db                *sql.DB
@@ -31,17 +36,20 @@ var (
 	templates         *template.Template
 	allowedBaseDomain string
 	caddyAPIPort      string
-	version           = "1.22"
+	version           = "1.31"
 	privateIPBlocks   []*net.IPNet
 	subdomainRegex    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
+	caddyConfigMu     sync.Mutex
 )
 
 // --- Data Models ---
 type Proxy struct {
-	ID         string
-	OwnerEmail string
-	Domain     string
-	Upstream   string
+	ID           string
+	OwnerEmail   string
+	Domain       string
+	Upstream     string
+	UpstreamTLS  bool
+	TLSInsecure  bool
 }
 
 type ProxyGroup struct {
@@ -63,6 +71,7 @@ type PageData struct {
 	AllowedDomain string
 	Version       string
 	Error         string
+	SyncStatus    string
 }
 
 // --- Initialization ---
@@ -91,6 +100,16 @@ func initDB() {
 	`
 	if _, err := db.Exec(queries); err != nil {
 		log.Fatal("Failed to create tables:", err)
+	}
+
+	migrations := []string{
+		`ALTER TABLE proxies ADD COLUMN upstream_tls INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE proxies ADD COLUMN tls_insecure INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, q := range migrations {
+		if _, err := db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			log.Printf("DB migration note: %v", err)
+		}
 	}
 
 	admin := strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL")))
@@ -147,6 +166,23 @@ func validateUpstream(upstream string) error {
 	return nil
 }
 
+func finalizeUpstream(upstream string, tls bool) string {
+	if strings.Contains(upstream, ":") {
+		return upstream
+	}
+	if tls {
+		return upstream + ":443"
+	}
+	return upstream + ":80"
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // --- Sorting Helpers ---
 func isDigit(b byte) bool { return '0' <= b && b <= '9' }
 
@@ -176,98 +212,285 @@ func naturalLess(s1, s2 string) bool {
 // reverseProxyHandle returns a Caddy reverse_proxy handler tuned for long-lived
 // streaming responses (SSE, WebSockets). Without flush_interval and disabled
 // upstream compression, events can be buffered or gzip-encoded and never reach clients.
-func reverseProxyHandle(finalUpstream string) map[string]interface{} {
+func reverseProxyHandle(finalUpstream string, upstreamTLS, tlsInsecure bool) map[string]interface{} {
+	transport := map[string]interface{}{
+		"protocol":    "http",
+		"compression": false,
+	}
+	if upstreamTLS {
+		tls := map[string]interface{}{}
+		if tlsInsecure {
+			tls["insecure_skip_verify"] = true
+		}
+		transport["tls"] = tls
+	}
+
 	return map[string]interface{}{
 		"handler":        "reverse_proxy",
 		"upstreams":      []interface{}{map[string]string{"dial": finalUpstream}},
 		"flush_interval": -1,
-		"transport": map[string]interface{}{
-			"protocol":    "http",
-			"compression": false,
-		},
+		"transport":      transport,
 	}
 }
 
-func updateCaddy(p Proxy) error {
-	finalUpstream := p.Upstream
-	if !strings.Contains(finalUpstream, ":") {
-		finalUpstream = finalUpstream + ":80"
+func caddyRoutesURL() string {
+	return fmt.Sprintf("http://localhost:%s/config/apps/http/servers/srv0/routes", caddyAPIPort)
+}
+
+func fetchCaddyRoutes() ([]map[string]interface{}, error) {
+	resp, err := http.Get(caddyRoutesURL())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("fetch routes (%d): %s", resp.StatusCode, string(b))
+	}
+	var routes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
+		return nil, err
+	}
+	return routes, nil
+}
+
+func postCaddyRoute(p Proxy) error {
+	finalUpstream := finalizeUpstream(p.Upstream, p.UpstreamTLS)
+	route := buildCaddyRoute(p, finalUpstream)
+	jsonData, _ := json.Marshal(route)
+
+	resp, err := http.Post(caddyRoutesURL(), "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	b, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("caddy POST route %s error (%d): %s", p.ID, resp.StatusCode, string(b))
+}
+
+func deleteCaddyRouteID(proxyID string) {
+	url := fmt.Sprintf("http://localhost:%s/id/%s", caddyAPIPort, proxyID)
+	req, _ := http.NewRequest("DELETE", url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+func hostMatcherIncludesDomain(hostVal interface{}, domain string) bool {
+	switch hosts := hostVal.(type) {
+	case string:
+		return hosts == domain
+	case []interface{}:
+		for _, h := range hosts {
+			if hs, ok := h.(string); ok && hs == domain {
+				return true
+			}
+		}
+	case []string:
+		for _, hs := range hosts {
+			if hs == domain {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func routeMatchers(route map[string]interface{}) []map[string]interface{} {
+	m, ok := route["match"]
+	if !ok {
+		return nil
+	}
+	switch v := m.(type) {
+	case []interface{}:
+		entries := make([]map[string]interface{}, 0, len(v))
+		for _, item := range v {
+			if mobj, ok := item.(map[string]interface{}); ok {
+				entries = append(entries, mobj)
+			}
+		}
+		return entries
+	case map[string]interface{}:
+		return []map[string]interface{}{v}
+	}
+	return nil
+}
+
+// routeMatchesProxy reports whether a Caddy route belongs to the given proxy.
+func routeMatchesProxy(route map[string]interface{}, proxyID, domain string) bool {
+	if proxyID != "" {
+		if id, ok := route["@id"].(string); ok && id == proxyID {
+			return true
+		}
+	}
+	if domain == "" {
+		return false
+	}
+	for _, mobj := range routeMatchers(route) {
+		if hostMatcherIncludesDomain(mobj["host"], domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// routeIsManagedByControlPlane reports routes owned by caddy-control and safe to replace.
+func routeIsManagedByControlPlane(route map[string]interface{}, proxies []Proxy) bool {
+	if id, ok := route["@id"].(string); ok && strings.HasPrefix(id, "proxy-") {
+		return true
+	}
+	for _, p := range proxies {
+		if routeMatchesProxy(route, p.ID, p.Domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeManagedRoutesFromArray deletes caddy-control routes from srv0/routes by index.
+// Caddy's admin API cannot replace the whole routes array with PUT (409 conflict); use DELETE per index.
+func removeManagedRoutesFromArray(proxies []Proxy) (int, error) {
+	routes, err := fetchCaddyRoutes()
+	if err != nil {
+		return 0, err
 	}
 
-	log.Printf("Caddy: Upserting route %s -> %s (ID: %s)", p.Domain, finalUpstream, p.ID)
+	var indices []int
+	for i, route := range routes {
+		if routeIsManagedByControlPlane(route, proxies) {
+			indices = append(indices, i)
+		}
+	}
 
-	route := map[string]interface{}{
+	removed := 0
+	for i := len(indices) - 1; i >= 0; i-- {
+		url := fmt.Sprintf("%s/%d", caddyRoutesURL(), indices[i])
+		req, _ := http.NewRequest("DELETE", url, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return removed, err
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return removed, fmt.Errorf("delete route index %d (%d)", indices[i], resp.StatusCode)
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func writeProxiesToCaddy(proxies []Proxy) error {
+	caddyConfigMu.Lock()
+	defer caddyConfigMu.Unlock()
+
+	// Clear ID index entries and orphaned array routes before re-adding.
+	routes, err := fetchCaddyRoutes()
+	if err != nil {
+		return err
+	}
+	seenIDs := make(map[string]bool)
+	for _, route := range routes {
+		if id, ok := route["@id"].(string); ok && strings.HasPrefix(id, "proxy-") {
+			seenIDs[id] = true
+		}
+	}
+	for _, p := range proxies {
+		seenIDs[p.ID] = true
+	}
+	for id := range seenIDs {
+		deleteCaddyRouteID(id)
+	}
+
+	removed, err := removeManagedRoutesFromArray(proxies)
+	if err != nil {
+		return err
+	}
+	if removed > 0 {
+		log.Printf("Caddy: Removed %d stale route(s) from routes array", removed)
+	}
+
+	for _, p := range proxies {
+		if err := postCaddyRoute(p); err != nil {
+			return err
+		}
+	}
+	log.Printf("Caddy: Wrote %d proxy route(s) to routes array", len(proxies))
+	return nil
+}
+
+func loadAllProxies() ([]Proxy, error) {
+	rows, err := db.Query("SELECT id, owner_email, domain, upstream, upstream_tls, tls_insecure FROM proxies")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var proxies []Proxy
+	for rows.Next() {
+		var p Proxy
+		var upstreamTLS, tlsInsecure int
+		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream, &upstreamTLS, &tlsInsecure)
+		p.UpstreamTLS = upstreamTLS != 0
+		p.TLSInsecure = tlsInsecure != 0
+		proxies = append(proxies, p)
+	}
+	return proxies, nil
+}
+
+func buildCaddyRoute(p Proxy, finalUpstream string) map[string]interface{} {
+	return map[string]interface{}{
 		"@id": p.ID,
 		"match": []interface{}{
 			map[string]interface{}{"host": []string{p.Domain}},
 		},
 		"handle": []interface{}{
-			reverseProxyHandle(finalUpstream),
+			reverseProxyHandle(finalUpstream, p.UpstreamTLS, p.TLSInsecure),
 		},
 	}
-	jsonData, _ := json.Marshal(route)
-
-	client := &http.Client{}
-
-	idUrl := fmt.Sprintf("http://localhost:%s/id/%s", caddyAPIPort, p.ID)
-	req, _ := http.NewRequest("PUT", idUrl, bytes.NewBuffer(jsonData))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil { return err }
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return nil
-	}
-
-	createUrl := fmt.Sprintf("http://localhost:%s/config/apps/http/servers/srv0/routes", caddyAPIPort)
-	resp2, err := client.Post(createUrl, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil { return err }
-	defer resp2.Body.Close()
-
-	if resp2.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp2.Body)
-		return fmt.Errorf("caddy error: %s", string(b))
-	}
-	return nil
-}
-
-func deleteCaddy(id string) {
-	url := fmt.Sprintf("http://localhost:%s/id/%s", caddyAPIPort, id)
-	req, _ := http.NewRequest("DELETE", url, nil)
-	client := &http.Client{}
-	client.Do(req)
 }
 
 // --- Sync Database to Caddy ---
+
+func syncProxiesToCaddy() error {
+	proxies, err := loadAllProxies()
+	if err != nil {
+		return err
+	}
+	var writeErr error
+	for i := 0; i < 5; i++ {
+		if writeErr = writeProxiesToCaddy(proxies); writeErr == nil {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return writeErr
+}
+
 func syncProxies() {
 	log.Println("Sync: Starting synchronization of Database -> Caddy...")
-
-	rows, err := db.Query("SELECT id, owner_email, domain, upstream FROM proxies")
-	if err != nil {
-		log.Printf("Sync Error: Failed to fetch proxies: %v", err)
+	if err := syncProxiesToCaddy(); err != nil {
+		log.Printf("Sync Error: %v", err)
 		return
 	}
-	defer rows.Close()
+	proxies, _ := loadAllProxies()
+	log.Printf("Sync: Wrote %d proxy route(s) to Caddy.", len(proxies))
+}
 
-	count := 0
-	for rows.Next() {
-		var p Proxy
-		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream)
-
-		go func(proxy Proxy) {
-			for i := 0; i < 5; i++ {
-				if err := updateCaddy(proxy); err == nil {
-					return
-				}
-				time.Sleep(2 * time.Second)
-			}
-			log.Printf("Sync Error: Could not push %s to Caddy after retries", proxy.Domain)
-		}(p)
-		count++
-	}
-	log.Printf("Sync: Queued %d proxies for update.", count)
+func triggerCaddySync() {
+	go func() {
+		if err := syncProxiesToCaddy(); err != nil {
+			log.Printf("Sync Error: background sync failed: %v", err)
+			return
+		}
+		proxies, _ := loadAllProxies()
+		log.Printf("Sync: Background sync wrote %d proxy route(s) to Caddy.", len(proxies))
+	}()
 }
 
 // --- Middleware ---
@@ -325,13 +548,16 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	email := session.Values["email"].(string)
 	role := session.Values["role"].(string)
 
-	rows, _ := db.Query("SELECT id, owner_email, domain, upstream FROM proxies")
+	rows, _ := db.Query("SELECT id, owner_email, domain, upstream, upstream_tls, tls_insecure FROM proxies")
 
 	groupsMap := make(map[string][]Proxy)
 
 	for rows.Next() {
 		var p Proxy
-		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream)
+		var upstreamTLS, tlsInsecure int
+		rows.Scan(&p.ID, &p.OwnerEmail, &p.Domain, &p.Upstream, &upstreamTLS, &tlsInsecure)
+		p.UpstreamTLS = upstreamTLS != 0
+		p.TLSInsecure = tlsInsecure != 0
 
 		sub := strings.TrimSuffix(p.Domain, "." + allowedBaseDomain)
 		parts := strings.Split(sub, ".")
@@ -365,8 +591,28 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	templates.ExecuteTemplate(w, "index.html", PageData{
-		Email: email, Role: role, ProxyGroups: proxyGroups, Users: users, AllowedDomain: allowedBaseDomain, Version: version,
+		Email: email, Role: role, ProxyGroups: proxyGroups, Users: users,
+		AllowedDomain: allowedBaseDomain, Version: version, SyncStatus: r.URL.Query().Get("sync"),
 	})
+}
+
+func handleSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	session, _ := store.Get(r, "caddy_session")
+	if session.Values["role"] != "admin" {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	status := "ok"
+	if err := syncProxiesToCaddy(); err != nil {
+		log.Printf("Sync Error: manual resync failed: %v", err)
+		status = "error"
+	}
+	http.Redirect(w, r, "/CaddyCfg/?sync="+status, http.StatusFound)
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -387,19 +633,22 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Forbidden", 403)
 			return
 		}
-		deleteCaddy(id)
 		if _, err := db.Exec("DELETE FROM proxies WHERE id=?", id); err != nil {
 			log.Printf("proxy delete DB error: %v", err)
 			http.Error(w, "database error", http.StatusInternalServerError)
 			return
 		}
+		triggerCaddySync()
 	} else {
 		subdomain := strings.ToLower(strings.TrimSpace(r.FormValue("subdomain")))
 		upstream := strings.TrimSpace(r.FormValue("upstream"))
-
-		if !strings.Contains(upstream, ":") {
-			upstream = upstream + ":80"
+		upstreamTLS := r.FormValue("upstream_tls") == "1"
+		tlsInsecure := r.FormValue("tls_insecure") == "1"
+		if tlsInsecure && !upstreamTLS {
+			tlsInsecure = false
 		}
+
+		upstream = finalizeUpstream(upstream, upstreamTLS)
 
 		if err := validateSubdomain(subdomain); err != nil {
 			http.Error(w, err.Error(), 400)
@@ -412,17 +661,16 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		fullDomain := fmt.Sprintf("%s.%s", subdomain, allowedBaseDomain)
 		newID := "proxy-" + subdomain
-		p := Proxy{ID: newID, OwnerEmail: email, Domain: fullDomain, Upstream: upstream}
 
-		if err := updateCaddy(p); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if _, err := db.Exec("INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream) VALUES (?, ?, ?, ?)", newID, email, fullDomain, upstream); err != nil {
+		if _, err := db.Exec(
+			"INSERT OR REPLACE INTO proxies (id, owner_email, domain, upstream, upstream_tls, tls_insecure) VALUES (?, ?, ?, ?, ?, ?)",
+			newID, email, fullDomain, upstream, boolToInt(upstreamTLS), boolToInt(tlsInsecure),
+		); err != nil {
 			log.Printf("proxy upsert DB error: %v", err)
-			http.Error(w, fmt.Sprintf("Caddy was updated but database write failed: %v", err), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("database write failed: %v", err), http.StatusInternalServerError)
 			return
 		}
+		triggerCaddySync()
 	}
 	http.Redirect(w, r, "/CaddyCfg/", http.StatusFound)
 }
@@ -446,6 +694,7 @@ func main() {
 	// -http-bind overrides BIND when non-empty; precedence: flag > BIND > 127.0.0.1.
 	httpBindFlag := flag.String("http-bind", "", "HTTP listen bind address (overrides BIND; default 127.0.0.1)")
 	versionFlag := flag.Bool("version", false, "print version and exit")
+	syncFlag := flag.Bool("sync", false, "sync database proxies to Caddy and exit")
 	flag.Parse()
 
 	if *versionFlag {
@@ -461,9 +710,19 @@ func main() {
 	if caddyAPIPort == "" { caddyAPIPort = "2019" }
 
 	initDB()
+
+	if *syncFlag {
+		if err := syncProxiesToCaddy(); err != nil {
+			log.Fatal("Sync failed:", err)
+		}
+		proxies, _ := loadAllProxies()
+		fmt.Printf("Synced %d proxy route(s) to Caddy.\n", len(proxies))
+		os.Exit(0)
+	}
+
 	go syncProxies()
 
-	templates = template.Must(template.ParseGlob("templates/*.html"))
+	templates = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 
 	store = sessions.NewCookieStore([]byte(os.Getenv("SESSION_SECRET")))
 	store.Options = &sessions.Options{Path: "/", MaxAge: 86400 * 7, HttpOnly: true}
@@ -475,6 +734,7 @@ func main() {
 	mux.HandleFunc("/", authRequired(handleDashboard))
 	mux.HandleFunc("/proxy", authRequired(handleProxy))
 	mux.HandleFunc("/user", authRequired(handleUser))
+	mux.HandleFunc("/sync", authRequired(handleSync))
 
 	port := os.Getenv("PORT")
 	if port == "" {

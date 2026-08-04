@@ -28,9 +28,20 @@
 
     <div class="container">
 
+        {{ if eq .SyncStatus "ok" }}
+        <div class="alert alert-success">Caddy resync completed successfully.</div>
+        {{ else if eq .SyncStatus "error" }}
+        <div class="alert alert-danger">Caddy resync failed. Check server logs for details.</div>
+        {{ end }}
+
         <div class="card shadow-sm mb-5">
             <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
                 <h5 class="mb-0">Active Reverse Proxies</h5>
+                {{ if eq .Role "admin" }}
+                <form action="/CaddyCfg/sync" method="POST" class="mb-0">
+                    <button type="submit" class="btn btn-sm btn-outline-primary">Resync Caddy</button>
+                </form>
+                {{ end }}
             </div>
             <div class="card-body p-0">
                 <table class="table table-hover mb-0">
@@ -56,7 +67,13 @@
                             <td class="ps-4 fw-bold">
                                 <a href="https://{{ .Domain }}" target="_blank" rel="noopener noreferrer" class="text-decoration-none">{{ .Domain }}</a>
                             </td>
-                            <td><code>{{ .Upstream }}</code></td>
+                            <td>
+                                <code>{{ .Upstream }}</code>
+                                {{ if .UpstreamTLS }}
+                                <span class="badge bg-info text-dark ms-1">TLS</span>
+                                {{ if .TLSInsecure }}<span class="badge bg-warning text-dark ms-1">Insecure</span>{{ end }}
+                                {{ end }}
+                            </td>
                             <td class="text-muted small">{{ .OwnerEmail }}</td>
                             <td class="text-end pe-4">
                                 {{ if or (eq $.Role "admin") (eq .OwnerEmail $.Email) }}
@@ -81,27 +98,48 @@
             {{ if ne .Role "viewer" }}
             <div class="card-footer bg-light p-4">
                 <h6 class="mb-3">Add New Proxy</h6>
-                <form action="/CaddyCfg/proxy" method="POST" class="row g-3" id="proxyForm" novalidate>
+                <form action="/CaddyCfg/proxy" method="POST" id="proxyForm" novalidate>
                     <input type="hidden" name="action" value="upsert">
 
-                    <div class="col-md-5">
-                        <label class="form-label small text-muted">Subdomain</label>
-                        <div class="input-group">
-                            <input type="text" name="subdomain" class="form-control text-end" placeholder="api.dev" id="subdomainInput" required>
-                            <span class="input-group-text bg-white text-dark">.{{ .AllowedDomain }}</span>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-5">
+                            <label class="form-label small text-muted">Subdomain</label>
+                            <div class="input-group">
+                                <input type="text" name="subdomain" class="form-control text-end" placeholder="api.dev" id="subdomainInput" required>
+                                <span class="input-group-text bg-white text-dark">.{{ .AllowedDomain }}</span>
+                            </div>
+                            <div id="subFeedback" class="validation-feedback text-danger"></div>
                         </div>
-                        <div id="subFeedback" class="validation-feedback text-danger"></div>
+
+                        <div class="col-md-5">
+                            <label class="form-label small text-muted">Upstream (Private IP)</label>
+                            <input type="text" name="upstream" class="form-control" placeholder="192.168.1.50" id="upstreamInput" required>
+                            <div class="form-text small">Default port 80 (HTTP) or 443 (TLS) if omitted.</div>
+                            <div id="upFeedback" class="validation-feedback text-danger"></div>
+                        </div>
+
+                        <div class="col-md-2 d-flex align-items-end">
+                            <button type="submit" class="btn btn-success w-100">Create</button>
+                        </div>
                     </div>
 
-                    <div class="col-md-5">
-                        <label class="form-label small text-muted">Upstream (Private IP)</label>
-                        <input type="text" name="upstream" class="form-control" placeholder="192.168.1.50" id="upstreamInput" required>
-                        <div class="form-text small">Default port 80 will be added if omitted.</div>
-                        <div id="upFeedback" class="validation-feedback text-danger"></div>
-                    </div>
-
-                    <div class="col-md-2 d-flex align-items-end">
-                        <button type="submit" class="btn btn-success w-100">Create</button>
+                    <div class="border rounded bg-white p-3">
+                        <div class="fw-semibold mb-2">Upstream TLS</div>
+                        <div class="row g-2">
+                            <div class="col-md-6">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" name="upstream_tls" value="1" id="upstreamTlsInput">
+                                    <label class="form-check-label" for="upstreamTlsInput">Connect with HTTPS</label>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" name="tls_insecure" value="1" id="tlsInsecureInput" disabled>
+                                    <label class="form-check-label" for="tlsInsecureInput">Ignore certificate errors</label>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-text small text-warning mb-0">Use insecure TLS only for self-signed or private CA certificates.</div>
                     </div>
                 </form>
             </div>
@@ -152,10 +190,26 @@
             const form = document.getElementById('proxyForm');
             const subInput = document.getElementById('subdomainInput');
             const upInput = document.getElementById('upstreamInput');
+            const upstreamTlsInput = document.getElementById('upstreamTlsInput');
+            const tlsInsecureInput = document.getElementById('tlsInsecureInput');
             const subFeedback = document.getElementById('subFeedback');
             const upFeedback = document.getElementById('upFeedback');
 
             if(!form) return;
+
+            function defaultPort() {
+                return upstreamTlsInput && upstreamTlsInput.checked ? "443" : "80";
+            }
+
+            upstreamTlsInput.addEventListener('change', function() {
+                tlsInsecureInput.disabled = !this.checked;
+                if (!this.checked) tlsInsecureInput.checked = false;
+                let val = upInput.value.trim();
+                if (val.length > 0 && !val.includes(':')) {
+                    upInput.value = val + ':' + defaultPort();
+                }
+                upInput.dispatchEvent(new Event('input'));
+            });
 
             subInput.addEventListener('input', function() {
                 this.value = this.value.toLowerCase().replace(/[^a-z0-9-.]/g, '');
@@ -170,7 +224,7 @@
                 let val = this.value.trim();
                 if (val.length > 0 && !val.includes(':')) {
                     if (/^(\d{1,3}\.){3}\d{1,3}$/.test(val)) {
-                        this.value = val + ":80";
+                        this.value = val + ":" + defaultPort();
                         this.dispatchEvent(new Event('input'));
                     }
                 }
@@ -215,7 +269,7 @@
 
             form.addEventListener('submit', function(e) {
                 let val = upInput.value.trim();
-                if (val.length > 0 && !val.includes(':')) upInput.value = val + ":80";
+                if (val.length > 0 && !val.includes(':')) upInput.value = val + ":" + defaultPort();
                 if (!form.checkValidity()) {
                     e.preventDefault(); e.stopPropagation();
                     subInput.dispatchEvent(new Event('input')); upInput.dispatchEvent(new Event('input'));
